@@ -1,10 +1,13 @@
-use std::{thread, io::BufReader, sync::mpsc::Sender, time::Duration, net::TcpListener};
+use std::{thread, sync::mpsc::Sender, time::Duration, net::TcpListener};
+
+use rand::Rng;
 
 pub enum ThreadMessage {
     Error(String),
     Warning(String),
     Info(String),
     PlotPoint(f64),
+    PlotOnLine(String, f64)
 }
 pub struct Server {
     running: bool,
@@ -34,7 +37,7 @@ impl Server {
 
         thread::spawn(move || {
             println!("In the thread...");
-            let listener = match TcpListener::bind(&address) {
+            let _listener = match TcpListener::bind(&address) {
                 Ok(listener) => listener,
                 Err(_) => {
                     sender.send(ThreadMessage::Error(format!("Invalid IP or port ({})", &address))).unwrap();
@@ -42,26 +45,12 @@ impl Server {
                 },
             };
 
+            let mut rng = rand::thread_rng();
+
             loop {
-                sender.send(ThreadMessage::Info("hello".to_owned())).unwrap();
-                thread::sleep(Duration::from_millis(1000));
+                sender.send(ThreadMessage::PlotOnLine("mKmvITs70dbf9X2o".to_owned(), rng.gen_range(-16.0..16.0))).unwrap();
+                thread::sleep(Duration::from_millis(100));
             }
-
-            // TODO: yea i dont know how threads work ig
-            /*println!("Crashy part...");
-            for stream in listener.incoming() {
-                let mut stream = match stream {
-                    Ok(stream) => stream,
-                    Err(_) => {
-                        sender.send(ThreadMessage::Error("Invalid stream".to_owned())).unwrap();
-                        return;
-                    },
-                };
-
-                let buf_reader = BufReader::new(&mut stream);
-                let request = String::from_utf8(buf_reader.buffer().to_vec()).unwrap();
-                println!("{}", request);
-            }*/
         });
     }
 }

@@ -1,7 +1,9 @@
-use std::sync::{mpsc::{Receiver, self}, Mutex};
+use std::{sync::mpsc::{Receiver, self}, collections::HashMap};
 
-use egui::{plot::{Line, PlotPoints}, Color32, RichText, Stroke, color_picker::Alpha};
+use clipboard::{ClipboardContext, ClipboardProvider};
+use egui::{plot::{Line, PlotPoints}, Color32, RichText, Stroke, color_picker::Alpha, Sense};
 use egui_extras::{TableBuilder, Column};
+use rand::{Rng, distributions::Alphanumeric};
 use regex::Regex;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
@@ -32,7 +34,7 @@ struct AddChannelWindow {
 }
 
 impl AddChannelWindow {
-    fn show(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame, channels: &mut Vec<Channel>) {
+    fn show(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame, channels: &mut HashMap<String, Channel>) {
         egui::Window::new("Add channel").show(ctx, |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
@@ -41,7 +43,7 @@ impl AddChannelWindow {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Ok").clicked() {
-                        channels.push(Channel::new(self.color));
+                        channels.insert(generate_channel_hash(), Channel::new(self.color));
                         self.open = false;
                     }
                     if ui.button("Cancel").clicked() {
@@ -142,11 +144,11 @@ enum Tab {
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct StormtrackerApp {
-    channels: Vec<Channel>,
+    channels: HashMap<String, Channel>,
+    current_tab: Tab,
     #[serde(skip)]
     add_channel_popup: AddChannelWindow,
-    current_tab: Tab,
-
+    
     #[serde(skip)]
     logging_tab: LoggingTab,
     #[serde(skip)]
@@ -157,23 +159,27 @@ pub struct StormtrackerApp {
     start_server_popup: StartServerWindow,
 
     #[serde(skip)]
+    clipboard_ctx: ClipboardContext,
+
+    #[serde(skip)]
     add_value: f64,
     #[serde(skip)]
-    current_channel_index: usize,
+    current_channel_hash: String,
 }
 
 impl Default for StormtrackerApp {
     fn default() -> Self {
         Self {
-            channels: vec![Channel::new(Color32::WHITE)],
+            channels: HashMap::new(),
             add_channel_popup: AddChannelWindow::default(),
             current_tab: Tab::default(),
             logging_tab: LoggingTab::new(),
             add_value: 0.0,
-            current_channel_index: 0,
+            current_channel_hash: String::new(),
             server: None,
             message_receiver: None,
             start_server_popup: StartServerWindow::new(),
+            clipboard_ctx: ClipboardProvider::new().unwrap(),
         }
     }
 }
@@ -196,7 +202,14 @@ impl StormtrackerApp {
                         ThreadMessage::Error(text) => self.logging_tab.lines.push((text, MessageType::Error)),
                         ThreadMessage::Warning(text) => self.logging_tab.lines.push((text, MessageType::Warning)),
                         ThreadMessage::Info(text) => self.logging_tab.lines.push((text, MessageType::Info)),
-                        ThreadMessage::PlotPoint(value) => self.channels[self.current_channel_index].values.push(value),
+                        ThreadMessage::PlotPoint(value) => match self.channels.get_mut(&self.current_channel_hash) {
+                            Some(v) => v.values.push(value),
+                            None => {},
+                        },
+                        ThreadMessage::PlotOnLine(k, v) => match self.channels.get_mut(&k) {
+                            Some(channel) => channel.values.push(v),
+                            None => {},
+                        }
                     }
                 }
             },
@@ -209,7 +222,19 @@ impl StormtrackerApp {
 
             ui.add(egui::DragValue::new(&mut self.add_value));
             if ui.button("Add datapoint").clicked() {
-                self.channels[self.current_channel_index].values.push(self.add_value);
+                match self.channels.get_mut(&self.current_channel_hash) {
+                    Some(v) => v.values.push(self.add_value),
+                    None => {},
+                }
+            }
+
+            if ui.button("Test values").clicked() {
+                for (i, (_, v)) in self.channels.iter_mut().enumerate() {
+                    let factor = i as f64;
+                    for x in 0..256 {
+                        v.values.push(x as f64 * factor);
+                    }
+                }
             }
 
             // Channel table
@@ -223,7 +248,7 @@ impl StormtrackerApp {
                 ui.separator();
 
                 // Table itself
-                let mut deletion_queue: Vec<usize> = Vec::new();
+                let mut deletion_queue: Vec<String> = Vec::new();
 
                 let table = TableBuilder::new(ui)
                     .striped(true)
@@ -251,7 +276,7 @@ impl StormtrackerApp {
                     });
                 })
                 .body(|mut body| {
-                    for (index, channel) in self.channels.iter_mut().enumerate() {
+                    for (index, (hash, channel)) in self.channels.iter_mut().enumerate() {
                         body.row(18.0, |mut row| {
                             // Color
                             row.col(|ui| {
@@ -263,9 +288,12 @@ impl StormtrackerApp {
                                 ui.label(index.to_string());
                             });
 
-                            // TODO: hash
+                            // Hash
                             row.col(|ui| {
-                                ui.label("TODO");
+                                if ui.add(egui::Label::new(hash).sense(Sense::click())).clicked() {
+                                    self.clipboard_ctx.set_contents(hash.to_string()).unwrap();
+                                    println!("test");
+                                }
                             });
 
                             // Show?
@@ -283,7 +311,7 @@ impl StormtrackerApp {
                             // Remove channel
                             row.col(|ui| {
                                 if ui.button("\u{2796}").clicked() {
-                                    deletion_queue.push(index);
+                                    deletion_queue.push(hash.to_string());
                                 }
                             });
                         });
@@ -291,8 +319,8 @@ impl StormtrackerApp {
                 });
 
                 // Delete queued elements
-                for index in deletion_queue {
-                    self.channels.remove(index);
+                for hash in deletion_queue {
+                    self.channels.remove(&hash);
                 }
             });
         });
@@ -302,14 +330,15 @@ impl StormtrackerApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let lines: Vec<Line> = self.channels
                 .iter()
-                .map(|x| {
+                .filter(|(_, v)| v.show)
+                .map(|(_, v)| {
                     Line::new(
-                        x.values
+                        v.values
                             .iter()
                             .enumerate()
                             .map(|(x, y)| [x as f64, *y])
                             .collect::<PlotPoints>()
-                    ).stroke(Stroke::new(2.0, x.color))
+                    ).stroke(Stroke::new(2.0, v.color))
                 })
                 .collect();
 
@@ -375,11 +404,11 @@ impl StormtrackerApp {
         }
     }
 
-    fn tab_terrain(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn tab_terrain(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // TODO
     }
 
-    fn tab_map(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn tab_map(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // TODO
     }
 }
@@ -410,4 +439,12 @@ impl eframe::App for StormtrackerApp {
             Tab::Map => self.tab_map(ctx, frame),
         }
     }
+}
+
+fn generate_channel_hash() -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect()
 }
