@@ -1,116 +1,413 @@
-/// We derive Deserialize/Serialize so we can persist app state on shutdown.
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(default)] // if we add new fields, give them default values when deserializing old state
-pub struct TemplateApp {
-    // Example stuff:
-    label: String,
+use std::sync::{mpsc::{Receiver, self}, Mutex};
 
-    // this how you opt-out of serialization of a member
-    #[serde(skip)]
-    value: f32,
+use egui::{plot::{Line, PlotPoints}, Color32, RichText, Stroke, color_picker::Alpha};
+use egui_extras::{TableBuilder, Column};
+use regex::Regex;
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
+
+use crate::{Server, ThreadMessage};
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct Channel {
+    values: Vec<f64>,
+    color: Color32,
+    show: bool
 }
 
-impl Default for TemplateApp {
-    fn default() -> Self {
+impl Channel {
+    fn new(color: Color32) -> Self {
         Self {
-            // Example stuff:
-            label: "Hello World!".to_owned(),
-            value: 2.7,
+            values: Vec::new(),
+            color,
+            show: true
         }
     }
 }
 
-impl TemplateApp {
-    /// Called once before the first frame.
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // This is also where you can customized the look at feel of egui using
-        // `cc.egui_ctx.set_visuals` and `cc.egui_ctx.set_fonts`.
+#[derive(Default)]
+struct AddChannelWindow {
+    open: bool,
+    color: Color32
+}
 
-        // Load previous app state (if any).
-        // Note that you must enable the `persistence` feature for this to work.
+impl AddChannelWindow {
+    fn show(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame, channels: &mut Vec<Channel>) {
+        egui::Window::new("Add channel").show(ctx, |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Color: ");
+                    egui::color_picker::color_edit_button_srgba(ui, &mut self.color, Alpha::Opaque);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Ok").clicked() {
+                        channels.push(Channel::new(self.color));
+                        self.open = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.open = false;
+                    }
+                });
+            });
+        });
+    }
+}
+
+struct StartServerWindow {
+    open: bool,
+    ip: String,
+    port: String,
+    ip_regex: Regex,
+}
+
+impl StartServerWindow {
+    fn new() -> Self {
+        Self {
+            open: false,
+            ip: "127.0.0.1".to_owned(),
+            port: "6969".to_owned(),
+            ip_regex: Regex::new("(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])").unwrap(),
+        }
+    }
+}
+
+impl StartServerWindow {
+    fn show<F>(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame, callback: F) where F: FnOnce() {
+        egui::Window::new("Start server").show(ctx, |ui| {
+            ui.vertical(|ui| {
+
+                // TODO: learn regex lmao
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.ip);
+                    if !self.ip_regex.is_match(&self.ip) {
+                        ui.label(RichText::new("Invalid IP").color(Color32::RED)); // <--- this doesn't quite work
+                    }
+                });
+                
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.port);
+                });
+
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    if ui.button("Ok").clicked() {
+                        self.open = false;
+                        callback();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.open = false;
+                    }
+                });
+                
+            });
+        });
+    }
+}
+
+#[derive(Debug)]
+enum MessageType {
+    Info,
+    Warning,
+    Error
+}
+
+struct LoggingTab {
+    lines: Vec<(String, MessageType)>,
+    errors: bool,
+    warnings: bool,
+    info: bool,
+}
+
+impl LoggingTab {
+    fn new() -> Self {
+        Self {
+            lines: vec![("Server is not running!".to_owned(), MessageType::Warning)],
+            errors: true,
+            warnings: true,
+            info: true,
+        }
+    }
+}
+
+#[derive(Default, serde::Deserialize, serde::Serialize, EnumIter, Debug, PartialEq, Clone, Copy)]
+enum Tab {
+    #[default]
+    Plot,
+    Log,
+    Terrain,
+    Map
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct StormtrackerApp {
+    channels: Vec<Channel>,
+    #[serde(skip)]
+    add_channel_popup: AddChannelWindow,
+    current_tab: Tab,
+
+    #[serde(skip)]
+    logging_tab: LoggingTab,
+    #[serde(skip)]
+    server: Option<Server>,
+    #[serde(skip)]
+    message_receiver: Option<Receiver<ThreadMessage>>,
+    #[serde(skip)]
+    start_server_popup: StartServerWindow,
+
+    #[serde(skip)]
+    add_value: f64,
+    #[serde(skip)]
+    current_channel_index: usize,
+}
+
+impl Default for StormtrackerApp {
+    fn default() -> Self {
+        Self {
+            channels: vec![Channel::new(Color32::WHITE)],
+            add_channel_popup: AddChannelWindow::default(),
+            current_tab: Tab::default(),
+            logging_tab: LoggingTab::new(),
+            add_value: 0.0,
+            current_channel_index: 0,
+            server: None,
+            message_receiver: None,
+            start_server_popup: StartServerWindow::new(),
+        }
+    }
+}
+
+impl StormtrackerApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Load state
         if let Some(storage) = cc.storage {
             return eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
         }
 
         Default::default()
     }
+
+    fn receive_messages(&mut self) {
+        match &self.message_receiver {
+            Some(r) => {
+                while let Ok(message) = r.try_recv() {
+                    match message {
+                        ThreadMessage::Error(text) => self.logging_tab.lines.push((text, MessageType::Error)),
+                        ThreadMessage::Warning(text) => self.logging_tab.lines.push((text, MessageType::Warning)),
+                        ThreadMessage::Info(text) => self.logging_tab.lines.push((text, MessageType::Info)),
+                        ThreadMessage::PlotPoint(value) => self.channels[self.current_channel_index].values.push(value),
+                    }
+                }
+            },
+            None => {},
+        }
+    }
+
+    fn tab_plot(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        egui::SidePanel::right("my_right_panel").show(ctx, |ui| {
+
+            ui.add(egui::DragValue::new(&mut self.add_value));
+            if ui.button("Add datapoint").clicked() {
+                self.channels[self.current_channel_index].values.push(self.add_value);
+            }
+
+            // Channel table
+            egui::CollapsingHeader::new("Channels").show(ui, |ui| {
+                // Controls
+                
+                if ui.button("\u{2795} Add channel").clicked() {
+                    self.add_channel_popup.open = true;
+                }
+
+                ui.separator();
+
+                // Table itself
+                let mut deletion_queue: Vec<usize> = Vec::new();
+
+                let table = TableBuilder::new(ui)
+                    .striped(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::auto())
+                    .column(Column::auto())
+                    .column(Column::auto())
+                    .column(Column::auto())
+                    .column(Column::auto())
+                    .column(Column::remainder())
+                    .min_scrolled_height(0.0);
+                
+                table.header(20.0, |mut header| {
+                    header.col(|ui| {
+                        ui.strong("Color");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Index");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Hash");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Show");
+                    });
+                })
+                .body(|mut body| {
+                    for (index, channel) in self.channels.iter_mut().enumerate() {
+                        body.row(18.0, |mut row| {
+                            // Color
+                            row.col(|ui| {
+                                ui.label(RichText::new("\u{23FA}").color(channel.color));
+                            });
+
+                            // Index
+                            row.col(|ui| {
+                                ui.label(index.to_string());
+                            });
+
+                            // TODO: hash
+                            row.col(|ui| {
+                                ui.label("TODO");
+                            });
+
+                            // Show?
+                            row.col(|ui| {
+                                ui.checkbox(&mut channel.show, "");
+                            });
+
+                            // Clear channel
+                            row.col(|ui| {
+                                if ui.button("C").clicked() {
+                                    channel.values.clear();
+                                }
+                            });
+
+                            // Remove channel
+                            row.col(|ui| {
+                                if ui.button("\u{2796}").clicked() {
+                                    deletion_queue.push(index);
+                                }
+                            });
+                        });
+                    }
+                });
+
+                // Delete queued elements
+                for index in deletion_queue {
+                    self.channels.remove(index);
+                }
+            });
+        });
+        
+        // Plot
+        // This is fun
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let lines: Vec<Line> = self.channels
+                .iter()
+                .map(|x| {
+                    Line::new(
+                        x.values
+                            .iter()
+                            .enumerate()
+                            .map(|(x, y)| [x as f64, *y])
+                            .collect::<PlotPoints>()
+                    ).stroke(Stroke::new(2.0, x.color))
+                })
+                .collect();
+
+            egui::plot::Plot::new("plot_0").show(ui, |plot_ui| {
+                for line in lines {
+                    plot_ui.line(line)
+                }
+            });
+        });
+
+        if self.add_channel_popup.open {
+            self.add_channel_popup.show(ctx, frame, &mut self.channels);
+        }
+    }
+
+    fn tab_log(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        egui::TopBottomPanel::bottom("my_bottom_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+
+                if ui.button("Start Server").clicked() {
+                    self.start_server_popup.open = true;
+                }
+
+                ui.checkbox(&mut self.logging_tab.info, "Info");
+                ui.checkbox(&mut self.logging_tab.warnings, "Warnings");
+                ui.checkbox(&mut self.logging_tab.errors, "Errors");
+            });
+        });
+
+        // Coloured and selectable text -- kind of hacky
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical(|ui| {
+                let mut lines: Vec<(&str, Color32)> = self.logging_tab.lines
+                    .iter()
+                    .filter(|(_text, level)| {
+                        match level {
+                            MessageType::Info => self.logging_tab.info,
+                            MessageType::Warning => self.logging_tab.warnings,
+                            MessageType::Error => self.logging_tab.errors,
+                        }
+                    })
+                    .map(|(text, level)| {
+                        (text.as_str(), match level {
+                            MessageType::Info => Color32::WHITE,
+                            MessageType::Warning => Color32::GOLD,
+                            MessageType::Error => Color32::RED,
+                        })
+                    })
+                    .collect();
+                for (text, color) in &mut lines {
+                    ui.add(egui::TextEdit::singleline(text).text_color(*color));
+                }
+            });
+        });
+
+        if self.start_server_popup.open {
+            self.start_server_popup.show(ctx, frame, || {
+                self.server = Some(Server::new());
+                let (sender, receiver) = mpsc::channel();
+                self.message_receiver = Some(receiver);
+                self.server.as_mut().unwrap().start(sender);
+            });
+        }
+    }
+
+    fn tab_terrain(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // TODO
+    }
+
+    fn tab_map(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // TODO
+    }
 }
 
-impl eframe::App for TemplateApp {
-    /// Called by the frame work to save state before shutdown.
+impl eframe::App for StormtrackerApp {
+    // Save state
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, self);
     }
 
-    /// Called each time the UI needs repainting, which may be many times per second.
-    /// Put your widgets into a `SidePanel`, `TopPanel`, `CentralPanel`, `Window` or `Area`.
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let Self { label, value } = self;
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
 
-        // Examples of how to create different panels and windows.
-        // Pick whichever suits you.
-        // Tip: a good default choice is to just keep the `CentralPanel`.
-        // For inspiration and more examples, go to https://emilk.github.io/egui
+        // Get messages from server thread (if it exists)
+        self.receive_messages();
 
-        #[cfg(not(target_arch = "wasm32"))] // no File->Quit on web pages!
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            // The top panel is often a good place for a menu bar:
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("Quit").clicked() {
-                        _frame.close();
-                    }
-                });
-            });
-        });
-
-        egui::SidePanel::left("side_panel").show(ctx, |ui| {
-            ui.heading("Side Panel");
-
+        egui::TopBottomPanel::top("my_top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Write something: ");
-                ui.text_edit_singleline(label);
-            });
-
-            ui.add(egui::Slider::new(value, 0.0..=10.0).text("value"));
-            if ui.button("Increment").clicked() {
-                *value += 1.0;
-            }
-
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label("powered by ");
-                    ui.hyperlink_to("egui", "https://github.com/emilk/egui");
-                    ui.label(" and ");
-                    ui.hyperlink_to(
-                        "eframe",
-                        "https://github.com/emilk/egui/tree/master/crates/eframe",
-                    );
-                    ui.label(".");
-                });
+                for tab in Tab::iter() {
+                    ui.selectable_value(&mut self.current_tab, tab, format!("{:?}", tab));
+                }
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // The central panel the region left after adding TopPanel's and SidePanel's
-
-            ui.heading("eframe template");
-            ui.hyperlink("https://github.com/emilk/eframe_template");
-            ui.add(egui::github_link_file!(
-                "https://github.com/emilk/eframe_template/blob/master/",
-                "Source code."
-            ));
-            egui::warn_if_debug_build(ui);
-        });
-
-        if false {
-            egui::Window::new("Window").show(ctx, |ui| {
-                ui.label("Windows can be moved by dragging them.");
-                ui.label("They are automatically sized based on contents.");
-                ui.label("You can turn on resizing and scrolling if you like.");
-                ui.label("You would normally chose either panels OR windows.");
-            });
+        match self.current_tab {
+            Tab::Plot => self.tab_plot(ctx, frame),
+            Tab::Log => self.tab_log(ctx, frame),
+            Tab::Terrain => self.tab_terrain(ctx, frame),
+            Tab::Map => self.tab_map(ctx, frame),
         }
     }
 }
